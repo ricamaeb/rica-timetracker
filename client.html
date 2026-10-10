@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rica Work Hours</title>
+<style>
+:root{--bg:#f7f5fb;--panel:#fff;--text:#211b2c;--muted:#756e80;--line:#e7e1ee;--accent:#8f6bb8;--green:#2f7d5a;--greenbg:#e8f5ee}
+*{box-sizing:border-box}
+body{margin:0;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text)}
+.app{max-width:1100px;margin:auto;padding:28px 18px}
+.top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:18px;flex-wrap:wrap}
+h1{margin:0;font-size:28px}.muted{color:var(--muted)}.small{font-size:12px}
+.panel,.card{background:var(--panel);border:1px solid var(--line);border-radius:18px}
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
+.card{padding:16px}.card small{color:var(--muted)}.card strong{display:block;font-size:24px;margin-top:5px}
+.panel{padding:18px;margin-bottom:16px}
+.status{display:inline-flex;padding:6px 10px;border-radius:999px;font-size:12px;font-weight:800;background:#f1eff4;color:var(--muted)}
+.status.live{background:var(--greenbg);color:var(--green)}
+.filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+input,button{font:inherit;border:1px solid var(--line);border-radius:10px;padding:9px 10px;background:white}
+button{cursor:pointer;font-weight:700}
+table{width:100%;border-collapse:collapse}th,td{padding:11px 9px;border-bottom:1px solid var(--line);text-align:left;font-size:13px}
+th{font-size:11px;color:var(--muted);text-transform:uppercase}.right{text-align:right}.wrap{overflow:auto}
+.empty{text-align:center;padding:30px;color:var(--muted)}
+.day{display:grid;grid-template-columns:120px 1fr 120px;gap:10px;padding:10px 0;border-bottom:1px solid var(--line)}
+.day:last-child{border-bottom:0}
+.error{background:#fff0f0;border:1px solid #efc7c7;color:#8d3333;padding:12px;border-radius:12px}
+@media(max-width:760px){.cards{grid-template-columns:1fr 1fr}.day{grid-template-columns:1fr}.right{text-align:left}}
+@media(max-width:460px){.cards{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="top">
+    <div>
+      <h1>Rica — Work Hours</h1>
+      <div class="muted small">Read-only client timesheet · U.S. Eastern Time</div>
+    </div>
+    <div id="liveStatus" class="status">Loading…</div>
+  </div>
+
+  <div class="cards">
+    <div class="card"><small>This week</small><strong id="weekTotal">00:00:00</strong></div>
+    <div class="card"><small>Days worked</small><strong id="daysWorked">0</strong></div>
+    <div class="card"><small>Today</small><strong id="todayTotal">00:00:00</strong></div>
+    <div class="card"><small>Last updated</small><strong id="updatedAt" style="font-size:16px">—</strong></div>
+  </div>
+
+  <div class="panel">
+    <div class="filters">
+      <input type="date" id="fromDate">
+      <input type="date" id="toDate">
+      <button type="button" id="refreshBtn">Refresh</button>
+    </div>
+    <div id="errorBox" class="error" style="display:none"></div>
+    <div class="wrap">
+      <table>
+        <thead><tr><th>Date</th><th>Task / Work</th><th>Start</th><th>End</th><th class="right">Duration</th></tr></thead>
+        <tbody id="rows"><tr><td colspan="5" class="empty">Loading work hours…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel">
+    <strong>Daily totals</strong>
+    <div id="dailyTotals" style="margin-top:10px"></div>
+  </div>
+</div>
+
+<script src="cloud-config.js"></script>
+<script>
+(() => {
+  const CFG=window.RICA_CLOUD_CONFIG||{};
+  const SUPABASE_URL=String(CFG.supabaseUrl||'').replace(/\/+$/,'');
+  const SUPABASE_ANON_KEY=String(CFG.anonKey||'');
+  const $=s=>document.querySelector(s);
+  const pad=n=>String(n).padStart(2,'0');
+
+  const fmtSec=s=>{
+    s=Math.max(0,Math.round(Number(s)||0));
+    const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;
+    return `${pad(h)}:${pad(m)}:${pad(sec)}`;
+  };
+
+  const datePretty=d=>{
+    if(!d)return'';
+    const [y,m,day]=d.split('-').map(Number);
+    return new Intl.DateTimeFormat('en-US',{month:'short',day:'numeric',year:'numeric'}).format(new Date(Date.UTC(y,m-1,day)));
+  };
+
+  const timePretty=t=>{
+    if(!t)return'—';
+    const [h,m]=t.split(':').map(Number);
+    return new Intl.DateTimeFormat('en-US',{hour:'numeric',minute:'2-digit'}).format(new Date(2000,0,1,h,m));
+  };
+
+  const easternToday=()=>new Intl.DateTimeFormat('en-CA',{
+    timeZone:'America/New_York',year:'numeric',month:'2-digit',day:'2-digit'
+  }).format(new Date());
+
+  const escapeHtml=s=>String(s??'').replace(/[&<>"']/g,c=>({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+
+  function durationSeconds(e){
+    if(Number.isFinite(Number(e.durationSec)))return Math.max(0,Number(e.durationSec));
+    const [sh,sm]=(e.start||'00:00').split(':').map(Number);
+    const [eh,em]=(e.end||'00:00').split(':').map(Number);
+    let mins=(eh*60+em)-(sh*60+sm);
+    if(mins<0)mins+=1440;
+    mins-=Number(e.lunch||0);
+    mins-=Number(e.pause||0);
+    return Math.max(0,mins*60);
+  }
+
+  function weekRange(d){
+    const [y,m,day]=d.split('-').map(Number);
+    const x=new Date(Date.UTC(y,m-1,day));
+    const dow=(x.getUTCDay()+6)%7;
+    const mon=new Date(x);mon.setUTCDate(x.getUTCDate()-dow);
+    const fri=new Date(mon);fri.setUTCDate(mon.getUTCDate()+4);
+    const f=a=>`${a.getUTCFullYear()}-${pad(a.getUTCMonth()+1)}-${pad(a.getUTCDate())}`;
+    return [f(mon),f(fri)];
+  }
+
+  const [wf,wt]=weekRange(easternToday());
+  $('#fromDate').value=wf;
+  $('#toDate').value=wt;
+
+  async function load(){
+    const token=new URLSearchParams(location.search).get('token')||'';
+    const err=$('#errorBox');
+    err.style.display='none';
+
+    if(!token){
+      err.textContent='This client link is missing its share token.';
+      err.style.display='block';
+      return;
+    }
+
+    if(!SUPABASE_URL||!SUPABASE_ANON_KEY||SUPABASE_URL.includes('PASTE_YOUR')){
+      err.textContent='Client dashboard is not connected yet. Add your Supabase URL and anon key to cloud-config.js.';
+      err.style.display='block';
+      return;
+    }
+
+    try{
+      $('#liveStatus').textContent='Refreshing…';
+
+      const res=await fetch(`${SUPABASE_URL}/rest/v1/rpc/client_tracker`,{
+        method:'POST',
+        headers:{
+          'Content-Type':'application/json',
+          'apikey':SUPABASE_ANON_KEY,
+          'Authorization':`Bearer ${SUPABASE_ANON_KEY}`
+        },
+        body:JSON.stringify({p_share_token:token})
+      });
+
+      if(!res.ok)throw new Error(await res.text());
+
+      const data=await res.json();
+      const snapshot=data.snapshot||{};
+      const from=$('#fromDate').value,to=$('#toDate').value;
+
+      const entries=(snapshot.entries||[])
+        .filter(e=>(!from||e.date>=from)&&(!to||e.date<=to))
+        .sort((a,b)=>a.date.localeCompare(b.date)||String(a.start).localeCompare(String(b.start)));
+
+      const byDate={};
+      entries.forEach(e=>(byDate[e.date]??=[]).push(e));
+
+      $('#rows').innerHTML=entries.length
+        ? entries.map(e=>`<tr>
+            <td>${datePretty(e.date)}</td>
+            <td>${escapeHtml(e.task||e.project||'Work')}</td>
+            <td>${timePretty(e.start)}</td>
+            <td>${timePretty(e.end)}</td>
+            <td class="right"><b>${fmtSec(durationSeconds(e))}</b></td>
+          </tr>`).join('')
+        : '<tr><td colspan="5" class="empty">No work entries for this period.</td></tr>';
+
+      $('#dailyTotals').innerHTML=Object.keys(byDate).sort().map(d=>{
+        const sec=byDate[d].reduce((a,e)=>a+durationSeconds(e),0);
+        return `<div class="day">
+          <b>${datePretty(d)}</b>
+          <span>${byDate[d].map(e=>escapeHtml(e.task||e.project||'Work')).join(' · ')}</span>
+          <b class="right">${fmtSec(sec)}</b>
+        </div>`;
+      }).join('')||'<div class="empty">No daily totals yet.</div>';
+
+      const [weekFrom,weekTo]=weekRange(easternToday());
+      const all=snapshot.entries||[];
+      const weekSec=all.filter(e=>e.date>=weekFrom&&e.date<=weekTo).reduce((a,e)=>a+durationSeconds(e),0);
+      const todaySec=all.filter(e=>e.date===easternToday()).reduce((a,e)=>a+durationSeconds(e),0);
+
+      $('#weekTotal').textContent=fmtSec(weekSec);
+      $('#todayTotal').textContent=fmtSec(todaySec);
+      $('#daysWorked').textContent=new Set(all.filter(e=>e.date>=weekFrom&&e.date<=weekTo).map(e=>e.date)).size;
+      $('#updatedAt').textContent=data.updated_at
+        ? new Intl.DateTimeFormat('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}).format(new Date(data.updated_at))
+        : '—';
+
+      const session=snapshot.session;
+      if(session){
+        $('#liveStatus').textContent=session.status==='paused'
+          ? 'Paused'
+          : session.status==='lunch'
+          ? 'On lunch'
+          : 'Working now';
+        $('#liveStatus').className='status '+(session.status==='working'?'live':'');
+      }else{
+        $('#liveStatus').textContent='Clocked out';
+        $('#liveStatus').className='status';
+      }
+    }catch(e){
+      err.textContent='Could not load work hours. '+String(e.message||e).slice(0,180);
+      err.style.display='block';
+      $('#liveStatus').textContent='Unavailable';
+    }
+  }
+
+  $('#refreshBtn').addEventListener('click',load);
+  $('#fromDate').addEventListener('change',load);
+  $('#toDate').addEventListener('change',load);
+
+  load();
+  setInterval(load,60000);
+})();
+</script>
+</body>
+</html>
